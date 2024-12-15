@@ -90,6 +90,7 @@ enum struct ExternalData {
 enum struct MessageData {
 	bool valid;
 	bool changed;
+	int idleTicks; // in rare cases sending seems to be spread over ticks. track idle ticks here :)
 	int sender;
 	char msg_name[MCP_MAXLENGTH_TRANPHRASE]; //Cstrike_Chat_AllSpec like stuff from resources/game_locale.txt
 	mcpSenderFlag senderflags;
@@ -136,6 +137,7 @@ enum struct MessageData {
 		this.senderflags = mcpSenderNone;
 		this.group = mcpTargetNone;
 		this.options = mcpMsgDefault;
+		this.idleTicks = 0;
 		int i;
 		for (;i<MCP_MAXLENGTH_COLORTAG;i++) this.msg_name[i] = this.sender_name[i] = this.customTagColor[i] = this.sender_display[i] = this.message[i] = 0;
 		for (;i<MCP_MAXLENGTH_NAME;i++) this.sender_name[i] = this.sender_display[i] = this.message[i] = 0;
@@ -277,6 +279,7 @@ public Action OnUserMessage_SayText2Proto(UserMsg msg_id, BfRead msg, const int[
 	int spliterated = FindExistingMessage();
 	if (spliterated >= 0) {
 		// all we need to do is append the recipients list, the rest is equal
+		g_processedMessages.Set(spliterated, MessageData::idleTicks, 0);
 		ArrayList recipients = g_processedMessages.Get(spliterated, MessageData::listRecipients);
 		for (int recipientIndex = 0; recipientIndex < playersNum; recipientIndex+=1) {
 			recipients.Push( GetClientUserId( players[recipientIndex] ) );
@@ -331,6 +334,7 @@ public Action OnUserMessage_SayText2BB(UserMsg msg_id, BfRead msg, const int[] p
 	int spliterated = FindExistingMessage();
 	if (spliterated >= 0) {
 		// all we need to do is append the recipients list, the rest is equal
+		g_processedMessages.Set(spliterated, MessageData::idleTicks, 0);
 		ArrayList recipients = g_processedMessages.Get(spliterated, MessageData::listRecipients);
 		for (int recipientIndex = 0; recipientIndex < playersNum; recipientIndex+=1) {
 			recipients.Push( GetClientUserId( players[recipientIndex] ) );
@@ -415,24 +419,15 @@ public Action OnClientSayCommand(int client, const char[] command, const char[] 
 }
 
 public void OnGameFrame() {
-	while (g_processedMessages.Length > 0) {
-		// pop message
-		//delete the previous handle, we will fetch an old one from the list
-		delete g_currentMessage.listRecipients;
-		g_processedMessages.GetArray(0, g_currentMessage);
-		g_processedMessages.Erase(0);
-		//re-map recipients from uids to clients
-		g_currentMessage.UserIdsToClients();
-		if (!g_currentMessage.valid) continue; //sender left
-
-		// process message
-		//if this failes we hopefully threw an error and will continue processing
-		//other messages in the next game tick, as this one was already dequeued
-		if (ProcessMessage()) {
-			ResendChatMessage();
-			Call_OnChatMessagePost();
-		} else if (g_currentMessage.message[0]!=0) { //process returned false, and message was not trimmed out? -> error
-			LogError("Pushed or didnt clear invalid message! %N :  %s", g_currentMessage.sender, g_currentMessage.message);
+	for (int index; index < g_processedMessages.Length; ) {
+		// age messages
+		int ageTicks = g_processedMessages.Get(index, MessageData::idleTicks)+1;
+		if (ageTicks < 2) {
+			PrintToServer("Age for msg %d now %d", index+1, ageTicks);
+			g_processedMessages.Set(index, MessageData::idleTicks, ageTicks);
+			index+=1;
+		} else {
+			DequeueMessage(index);
 		}
 	}
 	//we still have an old recipients list here that wasn't deleted. this instance
@@ -490,10 +485,38 @@ bool IsValidMessage() {
 }
 
 void QueueMessage() {
+	g_currentMessage.idleTicks = 0;
 	g_currentMessage.valid = true;
 	g_currentMessage.ClientsToUserIds();
 	g_processedMessages.PushArray(g_currentMessage); //push with .valid = true
 	g_currentMessage.Reset(.newRecipientsInstace = true); //because we pushed the list handle, sets .valid false
+}
+
+// pop one message back from the queue into the current message.
+// after you're done dequeueing, invalidate the current message with .valid = false
+// to properly guard it against rogue api calls.
+// NOTE: erases index from g_processedMessages
+void DequeueMessage(int index) {
+	// pop message
+	//delete the previous handle, we will fetch an old one from the list
+	delete g_currentMessage.listRecipients;
+	g_processedMessages.GetArray(index, g_currentMessage);
+	g_processedMessages.Erase(index);
+	//re-map recipients from uids to clients
+	g_currentMessage.UserIdsToClients();
+	if (!g_currentMessage.valid) {
+		return; //sender left
+	}
+
+	// process message
+	//if this failes we hopefully threw an error and will continue processing
+	//other messages in the next game tick, as this one was already dequeued
+	if (ProcessMessage()) {
+		ResendChatMessage();
+		Call_OnChatMessagePost();
+	} else if (g_currentMessage.message[0]!=0) { //process returned false, and message was not trimmed out? -> error
+		LogError("Pushed or didnt clear invalid message! %N :  %s", g_currentMessage.sender, g_currentMessage.message);
+	}
 }
 
 bool ProcessMessage() {
