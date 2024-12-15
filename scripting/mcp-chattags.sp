@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "24w45a"
+#define PLUGIN_VERSION "24w50a"
 
 #define STR_NO_PROFILE "None"
 #define STR_PERSONAL "Personal"
