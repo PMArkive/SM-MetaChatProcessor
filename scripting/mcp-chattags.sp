@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "24w24a"
+#define PLUGIN_VERSION "24w45a"
 
 #define STR_NO_PROFILE "None"
 #define STR_PERSONAL "Personal"
@@ -37,6 +37,7 @@ Cookie mcpct_profile; //profile name
 Cookie mcpct_crc; //if the crc changes, we have a new profile
 
 GlobalForward mcpct_fwd_change;
+GlobalForward mcpct_fwd_change_pre;
 
 ConVar cvar_settingsMenuEnabled;
 ConVar cvar_loadBehaviour;
@@ -45,7 +46,8 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max
 {
 	CreateNative("MCP_CT_GetClientProfiles", Native_GetProfiles);
 	CreateNative("MCP_CT_ForceClientProfile", Native_SetProfile);
-	RegPluginLibrary("MCPChatTags");
+	CreateNative("MCP_CT_GetClientCurrentProfile", Native_GetCurrentProfile);
+	RegPluginLibrary("MCP-ChatTags");
 	return APLRes_Success;
 }
 
@@ -59,6 +61,7 @@ public void OnPluginStart() {
 	mcpct_crc = new Cookie("mcpchattag_checksum", "CRC of available profiles to detect changes", CookieAccess_Private);
 
 	mcpct_fwd_change = CreateGlobalForward("MCP_CT_OnProfileChanged", ET_Event, Param_Cell, Param_String, Param_String, Param_String, Param_CellByRef);
+	mcpct_fwd_change_pre = CreateGlobalForward("MCP_CT_OnProfileSelect", ET_Event, Param_Cell, Param_String, Param_String, Param_String, Param_String, Param_String, Param_CellByRef);
 
 	SetCookieMenuItem(ChatTagCookieMenu, 0, "Chat Tag Settings");
 
@@ -246,32 +249,78 @@ void ProcessTagStyle(char[] tag, int taglen, ChatStyleOptions style) {
 	strcopy(tag, taglen, tagcopy);
 }
 
-void ApplyProfileValues(int client, const char[] name, const char[] prefix, const char[] color, ChatStyleOptions style) {
-	Call_StartForward(mcpct_fwd_change);
-	Call_PushCell(client);
-	Call_PushString(name);
-	Call_PushString(prefix);
-	Call_PushString(color);
-	ChatStyleOptions copyStyle=style;
-	Call_PushCellRef(copyStyle);
-	Action result;
-	if (Call_Finish(result)==SP_ERROR_NONE) {
-		if (result == Plugin_Stop) {
-			char buffer[32];
-			if (name[0]!=0) strcopy(buffer, sizeof(buffer), name);
-			else buffer = STR_NO_PROFILE;
-			PrintToChat(client, "[ChatTag] Could not activate profile \"%s\", change was blocked", buffer);
-			return;
-		} else if (result == Plugin_Handled) return;
-		else if (result == Plugin_Changed) style = copyStyle;
+void ApplyProfileValues(int client, const char[] name, const char[] _prefix, const char[] _color, ChatStyleOptions style) {
+	char tag[64], chatColor[12];
+	ChatStyleOptions copyStyle = style;
+	// copy into buffers we know the size of
+	strcopy(tag, sizeof(tag), _prefix);
+	strcopy(chatColor, sizeof(chatColor), _color);
+	PrintToConsole(client, "Apply color profile %s", tag);
+	if (mcpct_fwd_change_pre.FunctionCount > 0) {
+		char tagColor[12], nameColor[12];
+
+		// split up parts for that callback (again...)
+		if (!MCP_GetStringColor(tag, tagColor, sizeof(tagColor), false)) tagColor="\x01;";
+		if (!MCP_GetStringColor(tag[strlen(tagColor)], nameColor, sizeof(nameColor), true)) nameColor="\x03;";
+		MCP_RemoveTextColors(tag, sizeof(tag), false);
+
+		// call forward
+		Call_StartForward(mcpct_fwd_change_pre);
+		Call_PushCell(client);
+		Call_PushString(name);
+		Call_PushStringEx(tagColor, sizeof(tagColor), SM_PARAM_STRING_COPY|SM_PARAM_STRING_UTF8, SM_PARAM_COPYBACK);
+		Call_PushStringEx(tag, sizeof(tag), SM_PARAM_STRING_COPY|SM_PARAM_STRING_UTF8, SM_PARAM_COPYBACK);
+		Call_PushStringEx(nameColor, sizeof(nameColor), SM_PARAM_STRING_COPY|SM_PARAM_STRING_UTF8, SM_PARAM_COPYBACK);
+		Call_PushStringEx(chatColor, sizeof(chatColor), SM_PARAM_STRING_COPY|SM_PARAM_STRING_UTF8, SM_PARAM_COPYBACK);
+		Call_PushCellRef(copyStyle);
+		Action result = Plugin_Continue;
+
+		// restore, before we poke at it more
+		strcopy(tag, sizeof(tag), _prefix);
+		strcopy(chatColor, sizeof(chatColor), _color);
+
+		if (Call_Finish(result) == SP_ERROR_NONE) {
+			if (result == Plugin_Changed) {
+				// chage requested!
+				char newTagColor[12], newNameColor[12], newChatColor[12];
+				// make sure they don't bleed text into colors and build new prefix
+				if (!MCP_GetStringColor(tagColor, newTagColor, sizeof(newTagColor), false)) newTagColor = "\x01;";
+				if (!MCP_GetStringColor(nameColor, newNameColor, sizeof(newNameColor), false)) newNameColor = "\x03;";
+				MCP_RemoveTextColors(tag, sizeof(tag), false);
+				Format(tag, sizeof(tag), "%s%s%s", newTagColor, tag, newNameColor);
+				strcopy(newChatColor, sizeof(newChatColor), chatColor);
+				if (!MCP_GetStringColor(newChatColor, chatColor, sizeof(chatColor), true)) chatColor = "\x01;";
+				style = copyStyle;
+			} else if (result >= Plugin_Handled) {
+				return;
+			}
+		}
+	}
+	if (mcpct_fwd_change.FunctionCount > 0) {
+		Call_StartForward(mcpct_fwd_change);
+		Call_PushCell(client);
+		Call_PushString(name);
+		Call_PushString(tag);
+		Call_PushString(chatColor);
+		copyStyle=style;
+		Call_PushCellRef(copyStyle);
+		Action result;
+		if (Call_Finish(result)==SP_ERROR_NONE) {
+			if (result == Plugin_Stop) {
+				char buffer[32];
+				if (name[0]!=0) strcopy(buffer, sizeof(buffer), name);
+				else buffer = STR_NO_PROFILE;
+				PrintToChat(client, "[ChatTag] Could not activate profile \"%s\", change was blocked", buffer);
+				return;
+			} else if (result == Plugin_Handled) return;
+			else if (result == Plugin_Changed) style = copyStyle;
+		}
 	}
 
-	char tagcopy[64];
-	strcopy(tagcopy, sizeof(tagcopy), prefix);
-	ProcessTagStyle(tagcopy, sizeof(tagcopy), style);
+	ProcessTagStyle(tag, sizeof(tag), style);
 
-	MCP_SetClientDefaultNamePrefix(client, tagcopy);
-	if ((style&CS_CHATCOLOR)!=CS_NONE) MCP_SetClientDefaultChatColor(client, color);
+	MCP_SetClientDefaultNamePrefix(client, tag);
+	if ((style&CS_CHATCOLOR)!=CS_NONE) MCP_SetClientDefaultChatColor(client, chatColor);
 	else MCP_SetClientDefaultChatColor(client, "");
 }
 
@@ -518,3 +567,19 @@ public any Native_SetProfile(Handle plugin, int numParams) {
 	return 0;
 }
 
+int hlpr_min(int a, int b) {
+	return a < b ? a : b;
+}
+
+public any Native_GetCurrentProfile(Handle plugin, int numParams) {
+	int client = GetNativeCell(1);
+	if (!(1<=client<=MaxClients) || !IsClientInGame(client))
+		ThrowNativeError(SP_ERROR_INDEX, "Invalid client index");
+	int buffsz = GetNativeCell(3);
+	if (buffsz < 1)
+		ThrowNativeError(SP_ERROR_NATIVE, "Passed buffer size can not be <= 0");
+	char name[32];
+	mcpct_profile.Get(client, name, sizeof(name));
+	SetNativeString(2, name, hlpr_min(sizeof(name), buffsz));
+	return 0;
+}
